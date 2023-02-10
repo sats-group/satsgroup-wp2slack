@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -31,6 +32,7 @@ public class HttpCallbackFunction
         CancellationToken cancellationToken)
     {
         var log = executionContext.GetLogger(nameof(WorkplaceCallback));
+
         var query = 
             Microsoft.AspNetCore.WebUtilities.QueryHelpers.ParseQuery(req.Url.Query);
         
@@ -44,6 +46,11 @@ public class HttpCallbackFunction
 
         var json = await req.ReadAsStringAsync();
         log.LogInformation("Webhook called. Payload={Payload}", json);
+
+        if (!IsValidRequest(req, json, log))
+        {
+            return req.CreateResponse(HttpStatusCode.Unauthorized);
+        }
 
         if (json == null)
             return req.CreateResponse(HttpStatusCode.BadRequest);
@@ -94,12 +101,56 @@ public class HttpCallbackFunction
                 }
             };
             var jsonPayload = JsonConvert.SerializeObject(payload);
-        
-            var response = await _httpClient.PostAsync(new Uri(Environment.GetEnvironmentVariable("SlackWebhookUri")),
+
+            var slackWebhookUri = Environment.GetEnvironmentVariable("SlackWebhookUri");
+            if (string.IsNullOrEmpty(slackWebhookUri))
+            {
+                throw new InvalidOperationException("SlackWebhookUri env variable missing - unable to post to slack");
+            }
+            var response = await _httpClient.PostAsync(
+                new Uri(slackWebhookUri),
                 new StringContent(jsonPayload, Encoding.UTF8, "application/json"), cancellationToken);
+            response.EnsureSuccessStatusCode();
         }
 
         return req.CreateResponse(HttpStatusCode.OK);
+    }
+
+    private bool IsValidRequest(HttpRequestData req, string payload, ILogger log)
+    {
+        var secret = Environment.GetEnvironmentVariable("AppSecret");
+
+        if (string.IsNullOrEmpty(secret))
+            return true;
+
+        const string signatureHeader = "X-Hub-Signature-256";
+
+        const string prefix = "sha256=";
+
+        if (!req.Headers.Contains(signatureHeader))
+        {
+            log.LogWarning("Signature header missing");
+            return false;
+        }
+
+        var shaHeader = req.Headers.GetValues(signatureHeader).First();
+        log.LogInformation("SignatureHeader={SignatureHeader}", shaHeader);
+        var signature = shaHeader[prefix.Length..];
+
+        using var hasher = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+        var result = hasher.ComputeHash(Encoding.UTF8.GetBytes(payload));
+        return ToHexString(result) == signature;
+    }
+
+    private static string ToHexString(IReadOnlyCollection<byte> bytes)
+    {
+        var builder = new StringBuilder(bytes.Count * 2);
+        foreach (var b in bytes)
+        {
+            builder.Append($"{b:x2}");
+        }
+
+        return builder.ToString();
     }
 
     private string NewOrEditText(Entry post, string groupName)
@@ -130,7 +181,6 @@ public class HttpCallbackFunction
     private static bool IsVerificationRequest(Dictionary<string, StringValues> req)
         => req.ContainsKey("hub.mode")
                && req["hub.mode"] == "subscribe";
-    
 }
 
 public record WorkplaceGroupPosts(
